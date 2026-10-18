@@ -459,7 +459,58 @@ class DiffusionGemmaModelForBlockDiffusionConfig(VerifyAndUpdateConfig):
 
 class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
+    def _infer_expert_dtype(model_path: str) -> str | None:
+        """Read the routed-expert dtype off a local checkpoint's safetensors header.
+
+        Re-quantized V4 checkpoints (e.g. FP8 experts converted from the FP4
+        release) often drop ``expert_dtype`` from config.json, and the model
+        code would then assume MXFP4 experts and fail to load them.
+        """
+        import json
+        import re
+        from pathlib import Path
+
+        from vllm.transformers_utils.utils import parse_safetensors_file_metadata
+
+        index_file = Path(model_path) / "model.safetensors.index.json"
+        if not index_file.is_file():
+            return None
+        try:
+            weight_map = json.loads(index_file.read_text())["weight_map"]
+            expert_re = re.compile(r"\.experts\.\d+\.(w1|gate_proj)\.weight$")
+            name = next((n for n in weight_map if expert_re.search(n)), None)
+            if name is None:
+                return None
+            header = parse_safetensors_file_metadata(
+                index_file.parent / weight_map[name]
+            )
+            dtype = header[name]["dtype"]
+        except (OSError, KeyError, ValueError) as e:
+            logger.debug("Could not infer DeepSeek V4 expert_dtype: %s", e)
+            return None
+        if dtype.startswith("F8_"):
+            return "fp8"
+        # MXFP4 experts are stored as two e2m1 values packed per int8 byte.
+        if dtype in ("I8", "U8", "F4"):
+            return "fp4"
+        return None
+
+    @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
+        hf_config = model_config.hf_config
+        if getattr(hf_config, "model_type", None) == "deepseek_v4" and not hasattr(
+            hf_config, "expert_dtype"
+        ):
+            model_path = model_config.model_weights or model_config.model
+            expert_dtype = DeepseekV4ForCausalLMConfig._infer_expert_dtype(model_path)
+            if expert_dtype is not None:
+                logger.info(
+                    "config.json has no expert_dtype; inferred %r from the "
+                    "checkpoint's routed expert weights.",
+                    expert_dtype,
+                )
+                hf_config.expert_dtype = expert_dtype
+
         quant_config = getattr(model_config.hf_config, "quantization_config", None)
         if quant_config is not None and quant_config.get("quant_method") == "fp8":
             model_type = getattr(model_config.hf_config, "model_type", None)

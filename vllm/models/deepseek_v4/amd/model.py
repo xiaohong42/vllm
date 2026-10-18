@@ -88,6 +88,28 @@ from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
 
 logger = init_logger(__name__)
 
+_FP8_WEIGHT_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+_UNQUANTIZED_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+
+
+def _quantize_block_fp8(
+    weight: torch.Tensor, block_size: list[int] | None, scale_param: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Block-quantize an unquantized 2-D weight into an FP8 linear's layout."""
+    from vllm.utils.deep_gemm import per_block_cast_to_fp8
+
+    fp8, scale = per_block_cast_to_fp8(
+        weight.to(device=current_platform.device_type),
+        block_size or [128, 128],
+        use_ue8m0=True,
+    )
+    if scale_param.dtype == torch.uint8:
+        # Raw E8M0 exponent bytes.
+        scale = scale.to(torch.float8_e8m0fnu).view(torch.uint8)
+    else:
+        scale = scale.to(scale_param.dtype)
+    return fp8, scale
+
 
 class DeepseekV4MLP(nn.Module):
     def __init__(
@@ -1062,6 +1084,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.config = config
+        self._weight_block_size = getattr(quant_config, "weight_block_size", None)
         self.vocab_size = config.vocab_size
         self.hc_eps = config.hc_eps
         self.hc_mult = config.hc_mult
@@ -1380,6 +1403,28 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         continue
                     param_name = _resolve_param_name(name)
                     param = params_dict[param_name]
+                    scale_name = _resolve_param_name(
+                        name.removesuffix("weight") + "weight_scale"
+                    )
+                    if (
+                        name.endswith(".weight")
+                        and param.dtype in _FP8_WEIGHT_DTYPES
+                        and loaded_weight.dtype in _UNQUANTIZED_DTYPES
+                        and scale_name in params_dict
+                    ):
+                        # Some re-quantized V4 checkpoints keep a linear (e.g.
+                        # attn.wo_a) in BF16, and trainers syncing weights may
+                        # send it unquantized too. Casting it into the FP8
+                        # parameter with no scale yields NaN logits, so
+                        # quantize it the way V4 checkpoints are (ue8m0 blocks).
+                        scale_param = params_dict[scale_name]
+                        loaded_weight, scale = _quantize_block_fp8(
+                            loaded_weight, self._weight_block_size, scale_param
+                        )
+                        getattr(scale_param, "weight_loader", default_weight_loader)(
+                            scale_param, scale
+                        )
+                        loaded_params.add(scale_name)
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
